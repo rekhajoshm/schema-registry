@@ -294,13 +294,8 @@ public class AvroData {
         return null;
     }
 
-    boolean schemaOptional = schema != null ? schema.isOptional() : true;
-    if (!schemaOptional && logicalValue == null) {
-      throw new DataException("Found null value for non-optional schema");
-    }
+    validateSchemaValue(schema, logicalValue);
 
-    // Now it is safe to handle null values since we have validated that it is a valid value for the
-    // schema
     if (logicalValue == null) {
       // But if this is schemaless, we may not be able to return null directly
       if (schema == null && requireSchemalessContainerNull)
@@ -388,8 +383,9 @@ public class AvroData {
           // TODO most types don't need a new converted object since types pass through
           List<Object> converted = new ArrayList<>(list.size());
           Schema elementSchema = schema != null ? schema.valueSchema() : null;
-          org.apache.avro.Schema elementAvroSchema =
-              schema != null ? avroSchema.getElementType() : ANYTHING_SCHEMA;
+          org.apache.avro.Schema underlyingAvroSchema = avroSchemaForUnderlyingTypeIfOptional(schema, avroSchema);
+          org.apache.avro.Schema elementAvroSchema = 
+              schema != null ? underlyingAvroSchema.getElementType() : ANYTHING_SCHEMA;
           for (Object val : list) {
             converted.add(
                 fromConnectData(elementSchema, elementAvroSchema, val, false, true)
@@ -403,6 +399,7 @@ public class AvroData {
 
         case MAP: {
           Map<Object, Object> map = (Map<Object, Object>) value;
+          org.apache.avro.Schema underlyingAvroSchema = avroSchemaForUnderlyingTypeIfOptional(schema, avroSchema);
           if (schema != null &&
               schema.keySchema().type() == Schema.Type.STRING && !schema.keySchema().isOptional()) {
             // TODO most types don't need a new converted object since types pass through
@@ -410,7 +407,7 @@ public class AvroData {
             for (Map.Entry<Object, Object> entry : map.entrySet()) {
               // Key is a String, no conversion needed
               Object convertedValue = fromConnectData(schema.valueSchema(),
-                                                      avroSchema.getValueType(),
+                                                      underlyingAvroSchema.getValueType(),
                                                       entry.getValue(), false, true);
               converted.put((String)entry.getKey(), convertedValue);
             }
@@ -418,7 +415,7 @@ public class AvroData {
           } else {
             List<GenericRecord> converted = new ArrayList<>(map.size());
             org.apache.avro.Schema elementSchema =
-                schema != null ? avroSchema.getElementType() : ANYTHING_SCHEMA_MAP_ELEMENT;
+                schema != null ? underlyingAvroSchema.getElementType() : ANYTHING_SCHEMA_MAP_ELEMENT;
             org.apache.avro.Schema avroKeySchema = elementSchema.getField(KEY_FIELD).schema();
             org.apache.avro.Schema avroValueSchema = elementSchema.getField(VALUE_FIELD).schema();
             for (Map.Entry<Object, Object> entry : map.entrySet()) {
@@ -444,9 +441,10 @@ public class AvroData {
           Struct struct = (Struct) value;
           if (!struct.schema().equals(schema))
             throw new DataException("Mismatching struct schema");
-          GenericRecordBuilder convertedBuilder = new GenericRecordBuilder(avroSchema);
+          org.apache.avro.Schema underlyingAvroSchema = avroSchemaForUnderlyingTypeIfOptional(schema, avroSchema);
+          GenericRecordBuilder convertedBuilder = new GenericRecordBuilder(underlyingAvroSchema);
           for (Field field : schema.fields()) {
-            org.apache.avro.Schema fieldAvroSchema = avroSchema.getField(field.name()).schema();
+            org.apache.avro.Schema fieldAvroSchema = underlyingAvroSchema.getField(field.name()).schema();
             convertedBuilder.set(
                 field.name(),
                 fromConnectData(field.schema(), fieldAvroSchema, struct.get(field), false, true));
@@ -460,6 +458,33 @@ public class AvroData {
     } catch (ClassCastException e) {
       throw new DataException("Invalid type for " + schema.type() + ": " + value.getClass());
     }
+  }
+  
+  /**
+   * Connect optional fields are represented as a unions (null & type) in Avro
+   * Return the Avro schema of the actual type in the Union (instead of the union itself)
+   * @param schema
+   * @param avroSchema
+   * @return
+   */
+  private static org.apache.avro.Schema avroSchemaForUnderlyingTypeIfOptional(Schema schema, org.apache.avro.Schema avroSchema){
+    
+    if (schema != null && schema.isOptional()) {
+      if (avroSchema.getType() == org.apache.avro.Schema.Type.UNION) {
+        for (org.apache.avro.Schema typeSchema : avroSchema
+            .getTypes()) {
+          if (!typeSchema.getType().equals(
+              org.apache.avro.Schema.Type.NULL)) {
+              return typeSchema;
+          }
+        }
+      } else {
+        throw new DataException(
+            "An optinal schema should have an Avro Union type, not "
+                + schema.type());
+      }
+    }
+    return avroSchema;
   }
 
   private static Schema.Type schemaTypeForSchemalessJavaType(Object value) {
@@ -739,6 +764,12 @@ public class AvroData {
     return result;
   }
 
+  private static void validateSchemaValue(Schema schema, Object value) throws DataException{
+      if (value == null && schema != null && !schema.isOptional()) {
+        throw new DataException("Found null value for non-optional schema");
+      }
+  }
+  
   /**
    * Convert the given object, in Avro format, into an Connect data object.
    */
@@ -752,6 +783,10 @@ public class AvroData {
   }
 
   private Object toConnectData(Schema schema, Object value) {
+    validateSchemaValue(schema, value);
+    if (value == null) {
+      return null;
+    }  
     try {
       // If we're decoding schemaless data, we need to unwrap it into just the single value
       if (schema == null) {
